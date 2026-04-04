@@ -1,9 +1,12 @@
 import pandas as pd
 import os
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter
 
 
 # ==============================
-# PADRONIZAÇÃO DE COLUNAS
+# PADRONIZAÇÃO
 # ==============================
 def tratar_colunas(df):
     df.columns = (
@@ -22,9 +25,15 @@ def tratar_colunas(df):
     return df
 
 
-# ==============================
-# TRATAR VALORES MONETÁRIOS
-# ==============================
+def tratar_codigo(coluna):
+    return (
+        coluna.astype(str)
+        .str.replace(r'\.0$', '', regex=True)
+        .str.replace(r'\D', '', regex=True)
+        .str.strip()
+    )
+
+
 def tratar_valor(coluna):
     return (
         coluna.astype(str)
@@ -34,144 +43,218 @@ def tratar_valor(coluna):
     )
 
 
-# ==============================
-# CARREGAR FORNECEDOR (CORRIGIDO)
-# ==============================
-def carregar_fornecedor(caminho):
-    df = pd.read_excel(caminho, engine="openpyxl")
-    df = tratar_colunas(df)
+def detectar_coluna_codigo(df):
+    for c in df.columns:
+        if 'codigo' in c or 'ean' in c:
+            return c
+    return None
 
-    # Garantir nome padrão
-    df = df.rename(columns={
-        "codigo_de_barra": "codigo"
-    })
 
-    # 🔥 Pegar última coluna como preço
-    ultima_coluna = df.columns[-1]
-
-    df["preco"] = df[ultima_coluna]
-
-    # Limpar valores
-    df["preco"] = tratar_valor(df["preco"])
-    df["preco"] = pd.to_numeric(df["preco"], errors="coerce")
-
-    # Regra: 0 vira vazio
-    df["preco"] = df["preco"].replace(0, None)
-
-    # Remover linhas inválidas
-    df = df.dropna(subset=["codigo"])
-
-    return df[["codigo", "preco"]]
+def detectar_coluna_preco(df):
+    for c in df.columns:
+        if 'preco' in c or 'valor' in c:
+            return c
+    return df.columns[-1]
 
 
 # ==============================
-# NOME DO FORNECEDOR
+# CARREGAR FORNECEDORES
 # ==============================
-def extrair_nome_fornecedor(nome_arquivo):
-    nome = os.path.basename(nome_arquivo)
-    nome = nome.replace(".xlsx", "")
-    nome = nome.replace("fornecedor_", "")
-    return nome.upper()
-
-
-# ==============================
-# ADICIONAR VÁRIOS FORNECEDORES
-# ==============================
-def adicionar_multiplos_fornecedores(base_df, pasta):
-    if not os.path.exists(pasta):
-        print("⚠️ Pasta 'fornecedores' não encontrada. Criando automaticamente...")
-        os.makedirs(pasta)
-        return base_df
-
-    arquivos = [f for f in os.listdir(pasta) if f.endswith(".xlsx")]
-
-    if not arquivos:
-        print("⚠️ Nenhum fornecedor encontrado.")
-        return base_df
-
-    df_final = base_df.copy()
+def carregar_fornecedores(pasta):
+    arquivos = [f for f in os.listdir(pasta) if f.endswith('.xlsx')]
+    dfs = []
 
     for arquivo in arquivos:
         caminho = os.path.join(pasta, arquivo)
+        df = pd.read_excel(caminho, dtype=str)
 
-        print(f"📥 Lendo: {arquivo}")
+        df = tratar_colunas(df)
 
-        fornecedor_df = carregar_fornecedor(caminho)
-        nome = extrair_nome_fornecedor(arquivo)
+        col_codigo = detectar_coluna_codigo(df)
 
-        df_final = df_final.merge(
-            fornecedor_df,
-            on="codigo",
-            how="left"
-        )
+        if not col_codigo:
+            print(f"⚠️ {arquivo} ignorado (sem código)")
+            continue
 
-        df_final = df_final.rename(columns={"preco": nome})
+        df = df.rename(columns={col_codigo: 'codigo'})
+        df['codigo'] = tratar_codigo(df['codigo'])
+
+        col_preco = detectar_coluna_preco(df)
+
+        df['preco'] = tratar_valor(df[col_preco])
+        df['preco'] = pd.to_numeric(df['preco'], errors='coerce')
+
+        # REMOVE DUPLICAÇÃO
+        df = df.groupby('codigo', as_index=False).agg({'preco': 'min'})
+
+        nome = arquivo.replace('.xlsx', '').upper()
+        df = df.rename(columns={'preco': nome})
+
+        dfs.append(df)
+
+    if not dfs:
+        return pd.DataFrame()
+
+    df_final = dfs[0]
+
+    for df in dfs[1:]:
+        df_final = df_final.merge(df, on='codigo', how='outer')
 
     return df_final
 
 
 # ==============================
-# FORMATAÇÃO EXCEL (VERMELHO)
+# CALCULAR MELHORES OPÇÕES
 # ==============================
-def aplicar_formatacao(caminho_saida, nomes_fornecedores):
-    from openpyxl import load_workbook
-    from openpyxl.styles import PatternFill
+def calcular_melhores_opcoes(df, colunas_precos):
 
-    wb = load_workbook(caminho_saida)
-    ws = wb.active
+    def melhor(row):
+        precos = row[colunas_precos].dropna().sort_values()
+        return (precos.iloc[0], precos.index[0]) if len(precos) > 0 else (None, None)
 
+    def segundo(row):
+        precos = row[colunas_precos].dropna().sort_values()
+        return (precos.iloc[1], precos.index[1]) if len(precos) > 1 else (None, None)
+
+    df[['menor_preco', 'fornecedor_menor']] = df.apply(lambda r: pd.Series(melhor(r)), axis=1)
+    df[['segundo_preco', 'fornecedor_segundo']] = df.apply(lambda r: pd.Series(segundo(r)), axis=1)
+
+    return df
+
+
+# ==============================
+# PROCESSAMENTO
+# ==============================
+def processar_dados(df_base, df_fornecedores):
+
+    df_base['codigo'] = tratar_codigo(df_base['codigo']).astype(str)
+    df_fornecedores['codigo'] = tratar_codigo(df_fornecedores['codigo']).astype(str)
+
+    df = df_base.merge(df_fornecedores, on='codigo', how='left')
+
+    # remove duplicadas
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    colunas_base = [
+        'codigo', 'descricao.1', 'apresentacao',
+        'laboratorio', 'quantidade', 'ultimo_valor_pago'
+    ]
+
+    colunas_preco = [c for c in df.columns if c not in colunas_base]
+
+    for col in colunas_preco:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    df = calcular_melhores_opcoes(df, colunas_preco)
+
+    # 🔥 CORREÇÃO DO ERRO AQUI
+    df['quantidade'] = (
+        df['quantidade']
+        .astype(str)
+        .str.replace(",", ".")
+    )
+
+    df['quantidade'] = pd.to_numeric(df['quantidade'], errors='coerce')
+    df['menor_preco'] = pd.to_numeric(df['menor_preco'], errors='coerce')
+    df['segundo_preco'] = pd.to_numeric(df['segundo_preco'], errors='coerce')
+
+    df['total_menor'] = df['menor_preco'] * df['quantidade']
+    df['total_segundo'] = df['segundo_preco'] * df['quantidade']
+
+    return df
+
+
+# ==============================
+# FORMATAÇÃO EXCEL
+# ==============================
+def colorir_precos_maiores(ws):
     fill_vermelho = PatternFill(start_color="FF9999", end_color="FF9999", fill_type="solid")
 
-    # Identificar colunas
     colunas = {cell.value: idx for idx, cell in enumerate(ws[1], start=1)}
+    col_ultimo = colunas.get('ultimo_valor_pago')
 
-    col_ultimo = colunas.get("ultimo_valor")
+    if not col_ultimo:
+        return
 
-    for fornecedor in nomes_fornecedores:
-        col_forn = colunas.get(fornecedor)
+    colunas_base = [
+        'codigo', 'descricao', 'quantidade', 'ultimo_valor_pago',
+        'menor_preco', 'fornecedor_menor',
+        'segundo_preco', 'fornecedor_segundo',
+        'total_menor', 'total_segundo'
+    ]
 
-        if not col_forn:
+    colunas_fornecedores = [
+        (nome, idx) for nome, idx in colunas.items()
+        if nome not in colunas_base
+    ]
+
+    for row in range(2, ws.max_row + 1):
+        ultimo_valor = ws.cell(row=row, column=col_ultimo).value
+
+        if ultimo_valor is None:
             continue
 
-        for row in range(2, ws.max_row + 1):
-            valor_atual = ws.cell(row=row, column=col_forn).value
-            ultimo_valor = ws.cell(row=row, column=col_ultimo).value
+        for nome, col_idx in colunas_fornecedores:
+            valor = ws.cell(row=row, column=col_idx).value
 
-            if valor_atual and ultimo_valor:
-                if valor_atual > ultimo_valor:
-                    ws.cell(row=row, column=col_forn).fill = fill_vermelho
+            try:
+                if valor is not None and float(valor) > float(ultimo_valor):
+                    ws.cell(row=row, column=col_idx).fill = fill_vermelho
+            except:
+                pass
 
-    wb.save(caminho_saida)
+
+def formatar_excel(caminho):
+    wb = load_workbook(caminho)
+    ws = wb.active
+
+    fill_header = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    font_header = Font(bold=True, color="FFFFFF")
+
+    for cell in ws[1]:
+        cell.fill = fill_header
+        cell.font = font_header
+        cell.alignment = Alignment(horizontal='center')
+
+    colorir_precos_maiores(ws)
+
+    for col in ws.columns:
+        ws.column_dimensions[get_column_letter(col[0].column)].width = 20
+
+    wb.save(caminho)
+
+
+def exportar_excel(df, caminho_saida):
+    df.to_excel(caminho_saida, index=False)
+    formatar_excel(caminho_saida)
 
 
 # ==============================
 # MAIN
 # ==============================
 def main():
-    # Base tratada
-    base = pd.read_excel("base_tratada.xlsx")
+    print("📊 Carregando base...")
+    df_base = pd.read_excel("base_produtos.xlsx", dtype=str)
+    df_base = tratar_colunas(df_base)
 
-    pasta_fornecedores = "./fornecedores"
+    col_codigo = detectar_coluna_codigo(df_base)
 
-    df_final = adicionar_multiplos_fornecedores(base, pasta_fornecedores)
+    if not col_codigo:
+        raise Exception("❌ Base sem coluna de código")
 
-    print("\n📊 Preview:")
-    print(df_final.head())
+    df_base = df_base.rename(columns={col_codigo: 'codigo'})
+    df_base['codigo'] = tratar_codigo(df_base['codigo'])
 
-    # Salvar Excel
-    caminho_saida = "cotacao_final.xlsx"
-    df_final.to_excel(caminho_saida, index=False)
+    print("📦 Carregando fornecedores...")
+    df_fornecedores = carregar_fornecedores("./fornecedores")
 
-    # Pegar nomes dos fornecedores
-    nomes_fornecedores = [
-        col for col in df_final.columns
-        if col not in ["codigo", "descricao", "apresentacao", "laboratorio", "quantidade", "ultimo_valor"]
-    ]
+    print("⚙️ Processando...")
+    df_final = processar_dados(df_base, df_fornecedores)
 
-    # Aplicar formatação
-    aplicar_formatacao(caminho_saida, nomes_fornecedores)
+    print("📁 Exportando...")
+    exportar_excel(df_final, "cotacao_final.xlsx")
 
-    print("\n✅ Cotação final gerada com sucesso!")
+    print("✅ Concluído com sucesso!")
 
 
 if __name__ == "__main__":
